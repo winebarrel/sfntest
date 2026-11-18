@@ -14,6 +14,8 @@ type runner struct {
 	ctx      context.Context
 	sm       *StateMachine
 	env      *resolvedEnv
+	exec     Execution
+	typ      WorkflowType
 	input    any
 	execID   string
 	varBytes int
@@ -68,25 +70,28 @@ type stateCtx struct {
 }
 
 type mapItem struct {
-	index int
-	value any
+	index  int
+	value  any
+	key    string
+	hasKey bool
+	source string
 }
 
 func (r *runner) executionID() string {
 	if r.execID != "" {
 		return r.execID
 	}
-	arn := r.env.exec.StateMachineArn
-	if r.sm.opts.typ == Express {
-		r.execID = strings.Replace(arn, ":stateMachine:", ":express:", 1) + ":" + r.env.exec.Name + ":" + newUUID()
+	arn := r.exec.StateMachineArn
+	if r.typ == Express {
+		r.execID = strings.Replace(arn, ":stateMachine:", ":express:", 1) + ":" + r.exec.Name + ":" + newUUID()
 	} else {
-		r.execID = strings.Replace(arn, ":stateMachine:", ":execution:", 1) + ":" + r.env.exec.Name
+		r.execID = strings.Replace(arn, ":stateMachine:", ":execution:", 1) + ":" + r.exec.Name
 	}
 	return r.execID
 }
 
 func (r *runner) contextObject(sc stateCtx) map[string]any {
-	e := r.env.exec
+	e := r.exec
 	arn := e.StateMachineArn
 
 	execution := map[string]any{
@@ -117,12 +122,17 @@ func (r *runner) contextObject(sc stateCtx) map[string]any {
 		c["Task"] = map[string]any{"Token": sc.token}
 	}
 	if sc.mapItem != nil {
-		c["Map"] = map[string]any{
-			"Item": map[string]any{
-				"Index": mustNormalize(sc.mapItem.index),
-				"Value": sc.mapItem.value,
-			},
+		item := map[string]any{
+			"Index": mustNormalize(sc.mapItem.index),
+			"Value": sc.mapItem.value,
 		}
+		if sc.mapItem.hasKey {
+			item["Key"] = sc.mapItem.key
+		}
+		if sc.mapItem.source != "" {
+			item["Source"] = sc.mapItem.source
+		}
+		c["Map"] = map[string]any{"Item": item}
 	}
 	return c
 }
@@ -764,6 +774,9 @@ func (r *runner) runParallel(s *state, input any, sc *scope, stc stateCtx, ev *E
 }
 
 func (r *runner) runMap(s *state, input any, sc *scope, stc stateCtx, ev *Event) (any, error) {
+	if s.distributed() {
+		return r.runDistributedMap(s, input, sc, stc, ev)
+	}
 	eff, err := r.inputPath(s, input, sc, stc)
 	if err != nil {
 		return nil, err
@@ -791,7 +804,7 @@ func (r *runner) runMap(s *state, input any, sc *scope, stc stateCtx, ev *Event)
 		in := deepCopy(item)
 		if selector != nil {
 			ictx := stc
-			ictx.mapItem = &mapItem{index: i, value: item}
+			ictx.mapItem = &mapItem{index: i, value: item, source: "STATE_DATA"}
 			if in, err = r.evalTemplate(selector, r.penv(eff, sc, ictx)); err != nil {
 				return nil, err
 			}

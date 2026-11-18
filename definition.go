@@ -56,6 +56,51 @@ type processorConfig struct {
 	ExecutionType string `json:"ExecutionType"`
 }
 
+type itemReader struct {
+	Resource     string        `json:"Resource"`
+	Parameters   any           `json:"Parameters"`
+	Arguments    any           `json:"Arguments"`
+	ReaderConfig *readerConfig `json:"ReaderConfig"`
+}
+
+type readerConfig struct {
+	InputType         string    `json:"InputType"`
+	Transformation    string    `json:"Transformation"`
+	ManifestType      string    `json:"ManifestType"`
+	CSVDelimiter      string    `json:"CSVDelimiter"`
+	CSVHeaderLocation string    `json:"CSVHeaderLocation"`
+	CSVHeaders        []string  `json:"CSVHeaders"`
+	ItemsPointer      string    `json:"ItemsPointer"`
+	MaxItems          any       `json:"MaxItems"`
+	MaxItemsPath      optString `json:"MaxItemsPath"`
+}
+
+type itemBatcher struct {
+	MaxItemsPerBatch          any       `json:"MaxItemsPerBatch"`
+	MaxItemsPerBatchPath      optString `json:"MaxItemsPerBatchPath"`
+	MaxInputBytesPerBatch     any       `json:"MaxInputBytesPerBatch"`
+	MaxInputBytesPerBatchPath optString `json:"MaxInputBytesPerBatchPath"`
+	BatchInput                any       `json:"BatchInput"`
+}
+
+type resultWriter struct {
+	Resource     string        `json:"Resource"`
+	Parameters   any           `json:"Parameters"`
+	Arguments    any           `json:"Arguments"`
+	WriterConfig *writerConfig `json:"WriterConfig"`
+}
+
+type writerConfig struct {
+	OutputType     string `json:"OutputType"`
+	Transformation string `json:"Transformation"`
+}
+
+const (
+	resourceGetObject     = "arn:aws:states:::s3:getObject"
+	resourceListObjectsV2 = "arn:aws:states:::s3:listObjectsV2"
+	resourcePutObject     = "arn:aws:states:::s3:putObject"
+)
+
 type machine struct {
 	Comment         string                     `json:"Comment"`
 	StartAt         string                     `json:"StartAt"`
@@ -122,6 +167,16 @@ type state struct {
 	Iterator      *machine  `json:"Iterator"`
 	ItemProcessor *machine  `json:"ItemProcessor"`
 
+	// Distributed Map
+	ItemReader                     *itemReader   `json:"ItemReader"`
+	ItemBatcher                    *itemBatcher  `json:"ItemBatcher"`
+	ResultWriter                   *resultWriter `json:"ResultWriter"`
+	ToleratedFailureCount          any           `json:"ToleratedFailureCount"`
+	ToleratedFailurePercentage     any           `json:"ToleratedFailurePercentage"`
+	ToleratedFailureCountPath      optString     `json:"ToleratedFailureCountPath"`
+	ToleratedFailurePercentagePath optString     `json:"ToleratedFailurePercentagePath"`
+	Label                          string        `json:"Label"`
+
 	// JSONata
 	Arguments any `json:"Arguments"`
 	Output    any `json:"Output"`
@@ -133,6 +188,12 @@ func (s *state) has(key string) bool {
 }
 
 // processor returns the machine run for each Map item.
+// distributed reports whether s is a distributed Map state.
+func (s *state) distributed() bool {
+	p := s.processor()
+	return s.Type == "Map" && p != nil && p.ProcessorConfig != nil && p.ProcessorConfig.Mode == "DISTRIBUTED"
+}
+
 func (s *state) processor() *machine {
 	if s.ItemProcessor != nil {
 		return s.ItemProcessor
@@ -358,8 +419,8 @@ func (v *validator) state(s *state, path string) {
 		if s.ItemProcessor != nil && s.Iterator != nil {
 			v.errorf("%s: ItemProcessor and Iterator cannot be used together", path)
 		}
-		if p.ProcessorConfig != nil && p.ProcessorConfig.Mode == "DISTRIBUTED" {
-			v.errorf("%s: distributed Map is not supported yet", path)
+		if s.distributed() {
+			v.distributedMap(s, p, path)
 			return
 		}
 		for _, k := range []string{"ItemReader", "ItemBatcher", "ResultWriter", "ToleratedFailureCount", "ToleratedFailurePercentage", "ToleratedFailureCountPath", "ToleratedFailurePercentagePath", "Label"} {
@@ -791,4 +852,160 @@ func (v *validator) jsonataChoiceRule(path string, rule map[string]any) {
 	if a, ok := rule["Assign"].(map[string]any); ok {
 		v.jsonataAssign(path+".Assign", a)
 	}
+}
+
+func (v *validator) distributedMap(s *state, p *machine, path string) {
+	if v.typ == Express {
+		v.errorf("%s: distributed Map is not supported in Express workflows", path)
+	}
+
+	typ := Standard
+	switch p.ProcessorConfig.ExecutionType {
+	case "STANDARD":
+	case "EXPRESS":
+		typ = Express
+	default:
+		v.errorf("%s.ItemProcessor.ProcessorConfig.ExecutionType: must be STANDARD or EXPRESS", path)
+	}
+
+	if n := utf8.RuneCountInString(s.Label); n > 40 || strings.ContainsAny(s.Label, " \t\n?*<>{}[]:;,\\|^~$#%&`\"") {
+		v.errorf("%s.Label: must be at most 40 characters without whitespace or special characters", path)
+	}
+
+	jsonata := s.query == queryJSONata
+	expr := func(field string, val any) {
+		if jsonata {
+			v.jsonata(path+"."+field, val)
+		} else {
+			v.template(path+"."+field, val)
+		}
+	}
+	number := func(field string, val any, p optString) {
+		if val != nil && p.set {
+			v.errorf("%s: %s and %sPath cannot be used together", path, field, field)
+		}
+		if str, ok := val.(string); ok && jsonata {
+			v.jsonata(path+"."+field, str)
+		} else if val != nil {
+			if _, ok := toNonNegInt(val); !ok {
+				v.errorf("%s.%s: must be a non-negative integer", path, field)
+			}
+		}
+		if p.set && jsonata {
+			v.errorf("%s: field %q is not allowed in a JSONata state", path, field+"Path")
+		}
+		v.pathField(path+"."+field+"Path", p, true)
+	}
+
+	number("ToleratedFailureCount", s.ToleratedFailureCount, s.ToleratedFailureCountPath)
+	number("ToleratedFailurePercentage", s.ToleratedFailurePercentage, s.ToleratedFailurePercentagePath)
+	if n, ok := toNonNegInt(s.ToleratedFailurePercentage); ok && n > 100 {
+		v.errorf("%s.ToleratedFailurePercentage: must be between 0 and 100", path)
+	}
+
+	if r := s.ItemReader; r != nil {
+		rp := path + ".ItemReader"
+		if r.Resource != resourceGetObject && r.Resource != resourceListObjectsV2 {
+			v.errorf("%s.Resource: must be %s or %s", rp, resourceGetObject, resourceListObjectsV2)
+		}
+		if jsonata {
+			if r.Parameters != nil {
+				v.errorf("%s: field \"Parameters\" is not allowed in a JSONata state", rp)
+			}
+			v.jsonata(rp+".Arguments", r.Arguments)
+		} else {
+			if r.Arguments != nil {
+				v.errorf("%s: field \"Arguments\" is not allowed in a JSONPath state", rp)
+			}
+			v.template(rp+".Parameters", r.Parameters)
+		}
+
+		c := r.ReaderConfig
+		if c == nil {
+			c = &readerConfig{}
+		}
+		cp := rp + ".ReaderConfig"
+		switch c.InputType {
+		case "", "JSON", "JSONL", "CSV", "MANIFEST":
+		case "PARQUET":
+			v.errorf("%s.InputType: PARQUET is not supported yet", cp)
+		default:
+			v.errorf("%s.InputType: unknown input type %q", cp, c.InputType)
+		}
+		switch c.ManifestType {
+		case "":
+		case "S3_INVENTORY":
+			if c.InputType != "" {
+				v.errorf("%s: InputType must not be specified with the S3_INVENTORY manifest type", cp)
+			}
+		case "ATHENA_DATA":
+		default:
+			v.errorf("%s.ManifestType: unknown manifest type %q", cp, c.ManifestType)
+		}
+		switch c.Transformation {
+		case "", "NONE":
+		case "LOAD_AND_FLATTEN":
+			if c.InputType == "" {
+				v.errorf("%s: InputType is required with LOAD_AND_FLATTEN", cp)
+			}
+		default:
+			v.errorf("%s.Transformation: must be NONE or LOAD_AND_FLATTEN", cp)
+		}
+		if _, ok := csvDelimiters[c.CSVDelimiter]; !ok {
+			v.errorf("%s.CSVDelimiter: unknown delimiter %q", cp, c.CSVDelimiter)
+		}
+		switch c.CSVHeaderLocation {
+		case "", "FIRST_ROW":
+		case "GIVEN":
+			if len(c.CSVHeaders) == 0 {
+				v.errorf("%s.CSVHeaders: required when CSVHeaderLocation is GIVEN", cp)
+			}
+		default:
+			v.errorf("%s.CSVHeaderLocation: must be FIRST_ROW or GIVEN", cp)
+		}
+		number("ItemReader.ReaderConfig.MaxItems", c.MaxItems, c.MaxItemsPath)
+	} else if jsonata {
+		v.jsonata(path+".Items", s.Items)
+	}
+
+	if b := s.ItemBatcher; b != nil {
+		if b.MaxItemsPerBatch == nil && !b.MaxItemsPerBatchPath.set && b.MaxInputBytesPerBatch == nil && !b.MaxInputBytesPerBatchPath.set {
+			v.errorf("%s.ItemBatcher: MaxItemsPerBatch or MaxInputBytesPerBatch is required", path)
+		}
+		number("ItemBatcher.MaxItemsPerBatch", b.MaxItemsPerBatch, b.MaxItemsPerBatchPath)
+		number("ItemBatcher.MaxInputBytesPerBatch", b.MaxInputBytesPerBatch, b.MaxInputBytesPerBatchPath)
+		expr("ItemBatcher.BatchInput", b.BatchInput)
+	}
+
+	if w := s.ResultWriter; w != nil {
+		wp := path + ".ResultWriter"
+		if w.Resource == "" && w.WriterConfig == nil {
+			v.errorf("%s: Resource or WriterConfig is required", wp)
+		}
+		if w.Resource != "" && w.Resource != resourcePutObject {
+			v.errorf("%s.Resource: must be %s", wp, resourcePutObject)
+		}
+		if jsonata {
+			v.jsonata(wp+".Arguments", w.Arguments)
+		} else {
+			v.template(wp+".Parameters", w.Parameters)
+		}
+		if c := w.WriterConfig; c != nil {
+			switch c.OutputType {
+			case "", "JSON", "JSONL":
+			default:
+				v.errorf("%s.WriterConfig.OutputType: must be JSON or JSONL", wp)
+			}
+			switch c.Transformation {
+			case "", "NONE", "COMPACT", "FLATTEN":
+			default:
+				v.errorf("%s.WriterConfig.Transformation: must be NONE, COMPACT or FLATTEN", wp)
+			}
+		}
+	}
+
+	parent := v.typ
+	v.typ = typ
+	v.machine(p, path+".ItemProcessor.", s.query, false)
+	v.typ = parent
 }

@@ -265,6 +265,9 @@ func (r *runner) runParallelJSONata(s *state, input any, sc *scope, stc stateCtx
 }
 
 func (r *runner) runMapJSONata(s *state, input any, sc *scope, stc stateCtx, ev *Event) (any, error) {
+	if s.distributed() {
+		return r.runDistributedMap(s, input, sc, stc, ev)
+	}
 	vars, err := r.jsonataVars(sc, jsonataStates{input: input, context: r.contextObject(stc)})
 	if err != nil {
 		return nil, err
@@ -287,7 +290,7 @@ func (r *runner) runMapJSONata(s *state, input any, sc *scope, stc stateCtx, ev 
 		in := deepCopy(item)
 		if s.ItemSelector != nil {
 			ictx := stc
-			ictx.mapItem = &mapItem{index: i, value: item}
+			ictx.mapItem = &mapItem{index: i, value: item, source: "STATE_DATA"}
 			ivars, err := r.jsonataVars(sc, jsonataStates{input: input, context: r.contextObject(ictx)})
 			if err != nil {
 				return nil, err

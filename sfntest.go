@@ -182,6 +182,8 @@ func (sm *StateMachine) Run(ctx context.Context, input []byte, env *Env) (*Resul
 		ctx:   ctx,
 		sm:    sm,
 		env:   renv,
+		exec:  renv.exec,
+		typ:   sm.opts.typ,
 		input: in,
 	}
 	if r.jsonata, err = r.newJSONataEnv(renv.jsonata); err != nil {
