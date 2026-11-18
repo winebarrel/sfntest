@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"regexp"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -135,9 +137,9 @@ type state struct {
 	// Task
 	Resource             string     `json:"Resource"`
 	TimeoutSeconds       any        `json:"TimeoutSeconds"`
-	TimeoutSecondsPath   string     `json:"TimeoutSecondsPath"`
+	TimeoutSecondsPath   optString  `json:"TimeoutSecondsPath"`
 	HeartbeatSeconds     any        `json:"HeartbeatSeconds"`
-	HeartbeatSecondsPath string     `json:"HeartbeatSecondsPath"`
+	HeartbeatSecondsPath optString  `json:"HeartbeatSecondsPath"`
 	Credentials          any        `json:"Credentials"`
 	Retry                []*retrier `json:"Retry"`
 	Catch                []*catcher `json:"Catch"`
@@ -166,6 +168,9 @@ type state struct {
 	ItemSelector  any       `json:"ItemSelector"`
 	Iterator      *machine  `json:"Iterator"`
 	ItemProcessor *machine  `json:"ItemProcessor"`
+
+	MaxConcurrency     any       `json:"MaxConcurrency"`
+	MaxConcurrencyPath optString `json:"MaxConcurrencyPath"`
 
 	// Distributed Map
 	ItemReader                     *itemReader   `json:"ItemReader"`
@@ -235,6 +240,8 @@ type validator struct {
 	typ   WorkflowType
 	errs  []string
 	exprs map[string]*gnata.Expression
+	// $states fields allowed in the JSONata field being validated
+	allowResult, allowErrorOutput bool
 }
 
 func (v *validator) errorf(format string, args ...any) {
@@ -256,6 +263,9 @@ func parseMachine(def []byte, typ WorkflowType) (*machine, map[string]*gnata.Exp
 		v.errorf("QueryLanguage: unknown query language %q", query)
 	}
 	v.machine(m, "", query, true)
+	if len(v.errs) == 0 {
+		v.scopes(m, "", map[string]bool{})
+	}
 
 	if len(v.errs) > 0 {
 		return nil, nil, fmt.Errorf("invalid state machine definition:\n  %s", strings.Join(v.errs, "\n  "))
@@ -382,6 +392,7 @@ func (v *validator) state(s *state, path string) {
 		if s.Resource == "" {
 			v.errorf("%s.Resource: required", path)
 		}
+		v.taskTimeouts(s, path)
 		if v.typ == Express {
 			r := s.Resource
 			if strings.HasSuffix(r, ".sync") || strings.HasSuffix(r, ".sync:2") || strings.HasSuffix(r, ".waitForTaskToken") {
@@ -419,6 +430,7 @@ func (v *validator) state(s *state, path string) {
 		if s.ItemProcessor != nil && s.Iterator != nil {
 			v.errorf("%s: ItemProcessor and Iterator cannot be used together", path)
 		}
+		v.intField(s, path, "MaxConcurrency", s.MaxConcurrency, s.MaxConcurrencyPath, false)
 		if s.distributed() {
 			v.distributedMap(s, p, path)
 			return
@@ -616,8 +628,10 @@ func (v *validator) retryCatch(path string, s *state) {
 			if c.ResultPath.set {
 				v.errorf("%s: field \"ResultPath\" is not allowed in a JSONata state", p)
 			}
+			v.allowErrorOutput = true
 			v.jsonataAssign(p+".Assign", c.Assign)
 			v.jsonata(p+".Output", c.Output)
+			v.allowErrorOutput = false
 		} else {
 			if c.Output != nil {
 				v.errorf("%s: field \"Output\" is not allowed in a JSONPath state", p)
@@ -763,6 +777,12 @@ func (v *validator) jsonata(path string, t any) {
 			v.errorf("%s: a JSONata expression must start with '{%%' and end with '%%}'", path)
 			return
 		}
+		if !v.allowResult && reStatesResult.MatchString(t) {
+			v.errorf("%s: $states.result is not available in this field", path)
+		}
+		if !v.allowErrorOutput && reStatesErrorOutput.MatchString(t) {
+			v.errorf("%s: $states.errorOutput is not available in this field", path)
+		}
 		if _, ok := v.exprs[t]; ok {
 			return
 		}
@@ -794,8 +814,13 @@ func (v *validator) jsonataAssign(path string, a map[string]any) {
 
 func (v *validator) jsonataState(s *state, path string) {
 	v.jsonata(path+".Arguments", s.Arguments)
+	switch s.Type {
+	case "Task", "Parallel", "Map":
+		v.allowResult = true
+	}
 	v.jsonata(path+".Output", s.Output)
 	v.jsonataAssign(path+".Assign", s.Assign)
+	v.allowResult = false
 	v.jsonata(path+".Items", s.Items)
 	v.jsonata(path+".ItemSelector", s.ItemSelector)
 	v.jsonata(path+".TimeoutSeconds", s.TimeoutSeconds)
@@ -1008,4 +1033,103 @@ func (v *validator) distributedMap(s *state, p *machine, path string) {
 	v.typ = typ
 	v.machine(p, path+".ItemProcessor.", s.query, false)
 	v.typ = parent
+}
+
+var (
+	reStatesResult      = regexp.MustCompile(`\$states\s*\.\s*result\b`)
+	reStatesErrorOutput = regexp.MustCompile(`\$states\s*\.\s*errorOutput\b`)
+)
+
+// intField validates an integer field that may also be given as a path
+// (JSONPath) or a JSONata expression. It returns the literal value, if any.
+func (v *validator) intField(s *state, path, field string, val any, p optString, positive bool) (int64, bool) {
+	if val != nil && p.set {
+		v.errorf("%s: %s and %sPath cannot be used together", path, field, field)
+	}
+	v.pathField(path+"."+field+"Path", p, true)
+
+	if str, ok := val.(string); ok && s.query == queryJSONata && isJSONataExpr(str) {
+		v.jsonata(path+"."+field, str)
+		return 0, false
+	}
+	if val == nil {
+		return 0, false
+	}
+	n, ok := toNonNegInt(val)
+	switch {
+	case !ok && positive, positive && n == 0:
+		v.errorf("%s.%s: must be a positive integer", path, field)
+		return 0, false
+	case !ok:
+		v.errorf("%s.%s: must be a non-negative integer", path, field)
+		return 0, false
+	}
+	return n, true
+}
+
+func (v *validator) taskTimeouts(s *state, path string) {
+	timeout, tok := v.intField(s, path, "TimeoutSeconds", s.TimeoutSeconds, s.TimeoutSecondsPath, true)
+	heartbeat, hok := v.intField(s, path, "HeartbeatSeconds", s.HeartbeatSeconds, s.HeartbeatSecondsPath, true)
+	if tok && hok && heartbeat >= timeout {
+		v.errorf("%s: HeartbeatSeconds must be smaller than TimeoutSeconds", path)
+	}
+}
+
+// assignedNames returns the variables assigned by the states of m (not by
+// nested Parallel branches or Map iterations).
+func assignedNames(m *machine) []string {
+	var names []string
+	add := func(a map[string]any) {
+		for k := range a {
+			names = append(names, strings.TrimSuffix(k, ".$"))
+		}
+	}
+	for _, s := range m.states {
+		add(s.Assign)
+		for _, c := range s.Catch {
+			add(c.Assign)
+		}
+		for _, rule := range s.Choices {
+			if a, ok := rule["Assign"].(map[string]any); ok {
+				add(a)
+			}
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
+// scopes checks that a variable assigned in an inner scope (a Parallel
+// branch or an inline Map iteration) is not also assigned in an outer scope.
+func (v *validator) scopes(m *machine, prefix string, outer map[string]bool) {
+	names := assignedNames(m)
+	for _, n := range names {
+		if outer[n] {
+			v.errorf("%sStates: variable %q is already assigned in an outer scope", prefix, n)
+		}
+	}
+
+	inner := make(map[string]bool, len(outer)+len(names))
+	for k := range outer {
+		inner[k] = true
+	}
+	for _, n := range names {
+		inner[n] = true
+	}
+
+	for _, name := range slices.Sorted(maps.Keys(m.states)) {
+		s := m.states[name]
+		p := prefix + "States." + name
+		for i, b := range s.Branches {
+			v.scopes(b, fmt.Sprintf("%s.Branches[%d].", p, i), inner)
+		}
+		if proc := s.processor(); s.Type == "Map" && proc != nil {
+			if s.distributed() {
+				// child executions do not see the parent's variables
+				v.scopes(proc, p+".ItemProcessor.", map[string]bool{})
+			} else {
+				v.scopes(proc, p+".ItemProcessor.", inner)
+			}
+		}
+	}
 }

@@ -550,6 +550,21 @@ func (r *runner) runTask(s *state, input any, sc *scope, stc stateCtx, ev *Event
 	if err != nil {
 		return nil, err
 	}
+	for _, f := range []struct {
+		name string
+		path optString
+	}{{"TimeoutSecondsPath", s.TimeoutSecondsPath}, {"HeartbeatSecondsPath", s.HeartbeatSecondsPath}} {
+		if !f.path.set {
+			continue
+		}
+		v, err := r.evalExpr(f.path.v, r.penv(eff, sc, stc), ErrorRuntime)
+		if err != nil {
+			return nil, err
+		}
+		if n, ok := toNonNegInt(v); !ok || n == 0 {
+			return nil, statesErrorf(ErrorRuntime, "%s %s: must be a positive integer", f.name, f.path.v)
+		}
+	}
 	params := eff
 	if s.Parameters != nil {
 		if params, err = r.evalTemplate(s.Parameters, r.penv(eff, sc, stc)); err != nil {
