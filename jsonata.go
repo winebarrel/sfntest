@@ -228,12 +228,15 @@ var fromMillisExpr = func() *gnata.Expression {
 
 // fromMillis formats ms with the built-in $fromMillis, for $now(picture, timezone).
 func (r *runner) fromMillis(ms int64, args []any) (any, error) {
-	vars := map[string]any{"ms": ms}
-	if len(args) > 0 {
-		vars["picture"] = args[0]
-	}
-	if len(args) > 1 {
-		vars["timezone"] = args[1]
+	vars := map[string]any{"ms": float64(ms)}
+	for i, name := range []string{"picture", "timezone"} {
+		if i < len(args) {
+			v, err := toGnata(args[i])
+			if err != nil {
+				return nil, queryError("$now: %s", err)
+			}
+			vars[name] = v
+		}
 	}
 	v, err := fromMillisExpr.EvalWithVars(r.ctx, nil, vars)
 	if err != nil {

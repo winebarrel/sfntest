@@ -164,6 +164,9 @@ func parseDotName(s string) (segment, string, error) {
 		if c == '.' || c == '[' {
 			break
 		}
+		if c == ']' {
+			return segment{}, "", fmt.Errorf("unexpected ']'")
+		}
 		b.WriteByte(c)
 		i++
 	}
