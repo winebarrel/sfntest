@@ -7,7 +7,6 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"hash"
 	"math"
@@ -16,47 +15,260 @@ import (
 	"unicode/utf8"
 )
 
-// Intrinsic implements the intrinsic functions of the JSONPath query language.
-// Embed DefaultIntrinsic to override only some of them.
+// Func is an intrinsic function or a JSONata function.
 //
-// Return an error made by [Error] (usually States.IntrinsicFailure) to fail
-// the state. Any other error aborts [StateMachine.Run].
-type Intrinsic interface {
-	// Format replaces each {} in template with the next argument.
-	// \{, \} and \\ in template are literal characters.
-	Format(template string, args ...any) (string, error)
-	StringToJson(s string) (any, error)
-	JsonToString(v any) (string, error)
-	Array(args ...any) ([]any, error)
-	ArrayPartition(array []any, size int64) ([]any, error)
-	ArrayContains(array []any, v any) (bool, error)
-	ArrayRange(first, last, step int64) ([]any, error)
-	ArrayGetItem(array []any, index int64) (any, error)
-	ArrayLength(array []any) (int64, error)
-	ArrayUnique(array []any) ([]any, error)
-	Base64Encode(s string) (string, error)
-	Base64Decode(s string) (string, error)
-	Hash(data any, algorithm string) (string, error)
-	JsonMerge(a, b map[string]any, deep bool) (map[string]any, error)
-	// MathRandom returns a random integer in [start, end). seed is nil when omitted.
-	MathRandom(start, end int64, seed *int64) (int64, error)
-	MathAdd(a, b int64) (int64, error)
-	StringSplit(s, delimiters string) ([]any, error)
-	UUID() (string, error)
-}
+// args and the return value are JSON values: nil, bool, string,
+// json.Number, []any or map[string]any. Go numbers (int, float64, ...) are
+// also accepted as return values.
+//
+// Return an error made by [Error] to fail the state (States.IntrinsicFailure
+// for intrinsic functions, States.QueryEvaluationError for JSONata).
+// Any other error aborts [StateMachine.Run].
+type Func func(args ...any) (any, error)
 
-// DefaultIntrinsic implements the intrinsic functions as documented by AWS.
-type DefaultIntrinsic struct{}
-
-var _ Intrinsic = DefaultIntrinsic{}
+// IntrinsicFuncs replaces intrinsic functions of the JSONPath query language.
+// Keys are function names such as "States.UUID". Functions that are not in
+// the map keep their default implementation.
+type IntrinsicFuncs map[string]Func
 
 func intrinsicFailure(format string, args ...any) error {
 	return statesErrorf(ErrorIntrinsicFailure, format, args...)
 }
 
-const intrinsicStringLimit = 10000
+const (
+	intrinsicStringLimit = 10000
+	arrayRangeLimit      = 1000
+)
 
-func (DefaultIntrinsic) Format(template string, args ...any) (string, error) {
+// defaultIntrinsics implements the intrinsic functions as documented by AWS.
+// The number of arguments is checked by the parser.
+var defaultIntrinsics = map[string]Func{
+	"States.Format": func(args ...any) (any, error) {
+		t, err := argStr("States.Format", args[0])
+		if err != nil {
+			return nil, err
+		}
+		return format(t, args[1:])
+	},
+	"States.StringToJson": func(args ...any) (any, error) {
+		s, err := argStr("States.StringToJson", args[0])
+		if err != nil {
+			return nil, err
+		}
+		v, err := decodeJSON([]byte(s))
+		if err != nil {
+			return nil, intrinsicFailure("States.StringToJson: %s", err)
+		}
+		return v, nil
+	},
+	"States.JsonToString": func(args ...any) (any, error) {
+		return string(mustEncodeJSON(args[0])), nil
+	},
+	"States.Array": func(args ...any) (any, error) {
+		return append([]any{}, args...), nil
+	},
+	"States.ArrayPartition": func(args ...any) (any, error) {
+		a, err := argArray("States.ArrayPartition", args[0])
+		if err != nil {
+			return nil, err
+		}
+		n, err := argInt("States.ArrayPartition", args[1], math.Round)
+		if err != nil {
+			return nil, err
+		}
+		if n <= 0 {
+			return nil, intrinsicFailure("States.ArrayPartition: chunk size must be a positive integer")
+		}
+		return partition(a, n), nil
+	},
+	"States.ArrayContains": func(args ...any) (any, error) {
+		a, err := argArray("States.ArrayContains", args[0])
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range a {
+			if jsonEqual(e, args[1]) {
+				return true, nil
+			}
+		}
+		return false, nil
+	},
+	"States.ArrayRange": func(args ...any) (any, error) {
+		var n [3]int64
+		for i := range n {
+			v, err := argInt("States.ArrayRange", args[i], math.Round)
+			if err != nil {
+				return nil, err
+			}
+			n[i] = v
+		}
+		if n[2] == 0 {
+			return nil, intrinsicFailure("States.ArrayRange: step must not be zero")
+		}
+		out, ok := numberRange(n[0], n[1], n[2], arrayRangeLimit)
+		if !ok {
+			return nil, intrinsicFailure("States.ArrayRange: the result exceeds %d elements", arrayRangeLimit)
+		}
+		return out, nil
+	},
+	"States.ArrayGetItem": func(args ...any) (any, error) {
+		a, err := argArray("States.ArrayGetItem", args[0])
+		if err != nil {
+			return nil, err
+		}
+		i, err := argInt("States.ArrayGetItem", args[1], math.Round)
+		if err != nil {
+			return nil, err
+		}
+		if i < 0 || i >= int64(len(a)) {
+			return nil, intrinsicFailure("States.ArrayGetItem: index %d is out of range", i)
+		}
+		return a[i], nil
+	},
+	"States.ArrayLength": func(args ...any) (any, error) {
+		a, err := argArray("States.ArrayLength", args[0])
+		if err != nil {
+			return nil, err
+		}
+		return len(a), nil
+	},
+	"States.ArrayUnique": func(args ...any) (any, error) {
+		a, err := argArray("States.ArrayUnique", args[0])
+		if err != nil {
+			return nil, err
+		}
+		out := []any{}
+		for _, e := range a {
+			dup := false
+			for _, o := range out {
+				if jsonEqual(e, o) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				out = append(out, e)
+			}
+		}
+		return out, nil
+	},
+	"States.Base64Encode": func(args ...any) (any, error) {
+		s, err := argLimitedStr("States.Base64Encode", args[0])
+		if err != nil {
+			return nil, err
+		}
+		return base64.StdEncoding.EncodeToString([]byte(s)), nil
+	},
+	"States.Base64Decode": func(args ...any) (any, error) {
+		s, err := argLimitedStr("States.Base64Decode", args[0])
+		if err != nil {
+			return nil, err
+		}
+		b, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return nil, intrinsicFailure("States.Base64Decode: %s", err)
+		}
+		return string(b), nil
+	},
+	"States.Hash": func(args ...any) (any, error) {
+		data, ok := args[0].(string)
+		if !ok {
+			data = string(mustEncodeJSON(args[0]))
+		}
+		if utf8.RuneCountInString(data) > intrinsicStringLimit {
+			return nil, intrinsicFailure("States.Hash: the input exceeds %d characters", intrinsicStringLimit)
+		}
+		alg, err := argStr("States.Hash", args[1])
+		if err != nil {
+			return nil, err
+		}
+		h, err := hashString(data, alg)
+		if err != nil {
+			return nil, intrinsicFailure("States.Hash: %s", err)
+		}
+		return h, nil
+	},
+	"States.JsonMerge": func(args ...any) (any, error) {
+		a, err := argObject("States.JsonMerge", args[0])
+		if err != nil {
+			return nil, err
+		}
+		b, err := argObject("States.JsonMerge", args[1])
+		if err != nil {
+			return nil, err
+		}
+		if deep, ok := args[2].(bool); !ok || deep {
+			return nil, intrinsicFailure("States.JsonMerge: the third argument must be false (only shallow merge is supported)")
+		}
+		out := make(map[string]any, len(a)+len(b))
+		for k, v := range a {
+			out[k] = v
+		}
+		for k, v := range b {
+			out[k] = v
+		}
+		return out, nil
+	},
+	"States.MathRandom": func(args ...any) (any, error) {
+		start, err := argInt("States.MathRandom", args[0], math.Round)
+		if err != nil {
+			return nil, err
+		}
+		end, err := argInt("States.MathRandom", args[1], math.Round)
+		if err != nil {
+			return nil, err
+		}
+		if start >= end {
+			return nil, intrinsicFailure("States.MathRandom: start must be less than end")
+		}
+		n := uint64(end - start)
+		if len(args) > 2 {
+			seed, err := argInt("States.MathRandom", args[2], math.Round)
+			if err != nil {
+				return nil, err
+			}
+			r := rand.New(rand.NewPCG(uint64(seed), 0))
+			return start + int64(r.Uint64N(n)), nil
+		}
+		return start + int64(rand.Uint64N(n)), nil
+	},
+	"States.MathAdd": func(args ...any) (any, error) {
+		var n [2]int64
+		for i := range n {
+			v, err := argInt("States.MathAdd", args[i], math.Round)
+			if err != nil {
+				return nil, err
+			}
+			if v < math.MinInt32 || v > math.MaxInt32 {
+				return nil, intrinsicFailure("States.MathAdd: %d is out of the 32-bit integer range", v)
+			}
+			n[i] = v
+		}
+		return n[0] + n[1], nil
+	},
+	"States.StringSplit": func(args ...any) (any, error) {
+		s, err := argStr("States.StringSplit", args[0])
+		if err != nil {
+			return nil, err
+		}
+		d, err := argStr("States.StringSplit", args[1])
+		if err != nil {
+			return nil, err
+		}
+		out := []any{}
+		for _, f := range strings.FieldsFunc(s, func(r rune) bool { return strings.ContainsRune(d, r) }) {
+			out = append(out, f)
+		}
+		return out, nil
+	},
+	"States.UUID": func(...any) (any, error) {
+		return newUUID(), nil
+	},
+}
+
+// format replaces each {} in template with the next argument.
+// \{, \} and \\ in template are literal characters.
+func format(template string, args []any) (string, error) {
 	var b strings.Builder
 	n := 0
 	for i := 0; i < len(template); i++ {
@@ -86,113 +298,28 @@ func (DefaultIntrinsic) Format(template string, args ...any) (string, error) {
 	return b.String(), nil
 }
 
-func (DefaultIntrinsic) StringToJson(s string) (any, error) {
-	v, err := decodeJSON([]byte(s))
-	if err != nil {
-		return nil, intrinsicFailure("States.StringToJson: %s", err)
-	}
-	return v, nil
-}
-
-func (DefaultIntrinsic) JsonToString(v any) (string, error) {
-	return string(mustEncodeJSON(v)), nil
-}
-
-func (DefaultIntrinsic) Array(args ...any) ([]any, error) {
-	return append([]any{}, args...), nil
-}
-
-func (DefaultIntrinsic) ArrayPartition(array []any, size int64) ([]any, error) {
-	if size <= 0 {
-		return nil, intrinsicFailure("States.ArrayPartition: chunk size must be a positive integer")
-	}
+func partition(a []any, size int64) []any {
 	out := []any{}
-	for i := 0; i < len(array); i += int(size) {
-		out = append(out, append([]any{}, array[i:min(i+int(size), len(array))]...))
+	for i := 0; i < len(a); i += int(size) {
+		out = append(out, append([]any{}, a[i:min(i+int(size), len(a))]...))
 	}
-	return out, nil
+	return out
 }
 
-func (DefaultIntrinsic) ArrayContains(array []any, v any) (bool, error) {
-	for _, e := range array {
-		if jsonEqual(e, v) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-const arrayRangeLimit = 1000
-
-func (DefaultIntrinsic) ArrayRange(first, last, step int64) ([]any, error) {
-	if step == 0 {
-		return nil, intrinsicFailure("States.ArrayRange: step must not be zero")
-	}
+// numberRange returns first, first+step, ... up to last (inclusive).
+// ok is false when the result would exceed limit elements.
+func numberRange(first, last, step int64, limit int) ([]any, bool) {
 	out := []any{}
 	for i := first; (step > 0 && i <= last) || (step < 0 && i >= last); i += step {
-		if len(out) >= arrayRangeLimit {
-			return nil, intrinsicFailure("States.ArrayRange: the result exceeds %d elements", arrayRangeLimit)
+		if len(out) >= limit {
+			return nil, false
 		}
 		out = append(out, i)
 	}
-	return out, nil
+	return out, true
 }
 
-func (DefaultIntrinsic) ArrayGetItem(array []any, index int64) (any, error) {
-	if index < 0 || index >= int64(len(array)) {
-		return nil, intrinsicFailure("States.ArrayGetItem: index %d is out of range", index)
-	}
-	return array[index], nil
-}
-
-func (DefaultIntrinsic) ArrayLength(array []any) (int64, error) {
-	return int64(len(array)), nil
-}
-
-func (DefaultIntrinsic) ArrayUnique(array []any) ([]any, error) {
-	out := []any{}
-	for _, e := range array {
-		dup := false
-		for _, o := range out {
-			if jsonEqual(e, o) {
-				dup = true
-				break
-			}
-		}
-		if !dup {
-			out = append(out, e)
-		}
-	}
-	return out, nil
-}
-
-func (DefaultIntrinsic) Base64Encode(s string) (string, error) {
-	if utf8.RuneCountInString(s) > intrinsicStringLimit {
-		return "", intrinsicFailure("States.Base64Encode: the input exceeds %d characters", intrinsicStringLimit)
-	}
-	return base64.StdEncoding.EncodeToString([]byte(s)), nil
-}
-
-func (DefaultIntrinsic) Base64Decode(s string) (string, error) {
-	if utf8.RuneCountInString(s) > intrinsicStringLimit {
-		return "", intrinsicFailure("States.Base64Decode: the input exceeds %d characters", intrinsicStringLimit)
-	}
-	b, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return "", intrinsicFailure("States.Base64Decode: %s", err)
-	}
-	return string(b), nil
-}
-
-func (DefaultIntrinsic) Hash(data any, algorithm string) (string, error) {
-	s, ok := data.(string)
-	if !ok {
-		s = string(mustEncodeJSON(data))
-	}
-	if utf8.RuneCountInString(s) > intrinsicStringLimit {
-		return "", intrinsicFailure("States.Hash: the input exceeds %d characters", intrinsicStringLimit)
-	}
-
+func hashString(data, algorithm string) (string, error) {
 	var h hash.Hash
 	switch algorithm {
 	case "MD5":
@@ -206,267 +333,75 @@ func (DefaultIntrinsic) Hash(data any, algorithm string) (string, error) {
 	case "SHA-512":
 		h = sha512.New()
 	default:
-		return "", intrinsicFailure("States.Hash: unsupported algorithm: %s", algorithm)
+		return "", fmt.Errorf("unsupported algorithm: %s", algorithm)
 	}
-	h.Write([]byte(s))
+	h.Write([]byte(data))
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func (DefaultIntrinsic) JsonMerge(a, b map[string]any, deep bool) (map[string]any, error) {
-	if deep {
-		return nil, intrinsicFailure("States.JsonMerge: only shallow merge (false) is supported")
+func argStr(name string, v any) (string, error) {
+	s, ok := v.(string)
+	if !ok {
+		return "", intrinsicFailure("%s: expected a string, got %s", name, typeName(v))
 	}
-	out := make(map[string]any, len(a)+len(b))
-	for k, v := range a {
-		out[k] = v
-	}
-	for k, v := range b {
-		out[k] = v
-	}
-	return out, nil
+	return s, nil
 }
 
-func (DefaultIntrinsic) MathRandom(start, end int64, seed *int64) (int64, error) {
-	if start >= end {
-		return 0, intrinsicFailure("States.MathRandom: start must be less than end")
-	}
-	n := uint64(end - start)
-	if seed != nil {
-		r := rand.New(rand.NewPCG(uint64(*seed), 0))
-		return start + int64(r.Uint64N(n)), nil
-	}
-	return start + int64(rand.Uint64N(n)), nil
-}
-
-func (DefaultIntrinsic) MathAdd(a, b int64) (int64, error) {
-	for _, v := range []int64{a, b} {
-		if v < math.MinInt32 || v > math.MaxInt32 {
-			return 0, intrinsicFailure("States.MathAdd: %d is out of the 32-bit integer range", v)
-		}
-	}
-	return a + b, nil
-}
-
-func (DefaultIntrinsic) StringSplit(s, delimiters string) ([]any, error) {
-	out := []any{}
-	for _, f := range strings.FieldsFunc(s, func(r rune) bool { return strings.ContainsRune(delimiters, r) }) {
-		out = append(out, f)
-	}
-	return out, nil
-}
-
-func (DefaultIntrinsic) UUID() (string, error) {
-	return newUUID(), nil
-}
-
-// ---- parsing ----
-
-type argKind int
-
-const (
-	argString argKind = iota
-	argNumber
-	argNull
-	argBool
-	argPath
-	argCall
-)
-
-type fnArg struct {
-	kind argKind
-	str  string
-	// tmpl is the string literal with \{, \} and \\ kept escaped, for States.Format.
-	tmpl string
-	num  json.Number
-	b    bool
-	path *jsonPath
-	call *fnCall
-}
-
-type fnCall struct {
-	name string
-	args []fnArg
-}
-
-const maxIntrinsicNesting = 10
-
-func parseIntrinsic(s string) (*fnCall, error) {
-	c, rest, err := parseCall(strings.TrimSpace(s), 1)
+func argLimitedStr(name string, v any) (string, error) {
+	s, err := argStr(name, v)
 	if err != nil {
-		return nil, fmt.Errorf("invalid intrinsic function %s: %w", s, err)
+		return "", err
 	}
-	if strings.TrimSpace(rest) != "" {
-		return nil, fmt.Errorf("invalid intrinsic function %s: unexpected %q", s, rest)
+	if utf8.RuneCountInString(s) > intrinsicStringLimit {
+		return "", intrinsicFailure("%s: the input exceeds %d characters", name, intrinsicStringLimit)
 	}
-	return c, nil
+	return s, nil
 }
 
-func parseCall(s string, depth int) (*fnCall, string, error) {
-	if depth > maxIntrinsicNesting {
-		return nil, "", fmt.Errorf("intrinsic functions are nested more than %d levels", maxIntrinsicNesting)
+func argArray(name string, v any) ([]any, error) {
+	a, ok := v.([]any)
+	if !ok {
+		return nil, intrinsicFailure("%s: expected an array, got %s", name, typeName(v))
 	}
-
-	open := strings.IndexByte(s, '(')
-	if open < 0 {
-		return nil, "", fmt.Errorf("missing '('")
-	}
-	name := strings.TrimSpace(s[:open])
-	if _, ok := intrinsicArity[name]; !ok {
-		return nil, "", fmt.Errorf("unknown function %q", name)
-	}
-
-	c := &fnCall{name: name}
-	rest := strings.TrimLeft(s[open+1:], " \t\n")
-	if strings.HasPrefix(rest, ")") {
-		return c, rest[1:], checkArity(c)
-	}
-
-	for {
-		arg, r, err := parseArg(strings.TrimLeft(rest, " \t\n"), depth)
-		if err != nil {
-			return nil, "", err
-		}
-		c.args = append(c.args, arg)
-		r = strings.TrimLeft(r, " \t\n")
-		if r == "" {
-			return nil, "", fmt.Errorf("missing ')'")
-		}
-		switch r[0] {
-		case ',':
-			rest = r[1:]
-		case ')':
-			return c, r[1:], checkArity(c)
-		default:
-			return nil, "", fmt.Errorf("unexpected %q", r)
-		}
-	}
+	return a, nil
 }
 
-func parseArg(s string, depth int) (fnArg, string, error) {
-	switch {
-	case s == "":
-		return fnArg{}, "", fmt.Errorf("missing argument")
-	case s[0] == '\'':
-		var b, t strings.Builder
-		for i := 1; i < len(s); i++ {
-			c := s[i]
-			if c == '\\' {
-				if i+1 >= len(s) || !strings.ContainsRune(`'{}\`, rune(s[i+1])) {
-					return fnArg{}, "", fmt.Errorf("open escape in string literal")
-				}
-				i++
-				b.WriteByte(s[i])
-				if s[i] != '\'' {
-					t.WriteByte('\\')
-				}
-				t.WriteByte(s[i])
-				continue
-			}
-			if c == '\'' {
-				return fnArg{kind: argString, str: b.String(), tmpl: t.String()}, s[i+1:], nil
-			}
-			b.WriteByte(c)
-			t.WriteByte(c)
-		}
-		return fnArg{}, "", fmt.Errorf("unclosed string literal")
-	case s[0] == '$':
-		end := argEnd(s)
-		p, err := parsePath(strings.TrimSpace(s[:end]))
-		if err != nil {
-			return fnArg{}, "", err
-		}
-		return fnArg{kind: argPath, path: p}, s[end:], nil
-	case strings.HasPrefix(s, "States."):
-		c, rest, err := parseCall(s, depth+1)
-		if err != nil {
-			return fnArg{}, "", err
-		}
-		return fnArg{kind: argCall, call: c}, rest, nil
+func argObject(name string, v any) (map[string]any, error) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, intrinsicFailure("%s: expected an object, got %s", name, typeName(v))
 	}
-
-	end := argEnd(s)
-	tok := strings.TrimSpace(s[:end])
-	switch tok {
-	case "null":
-		return fnArg{kind: argNull}, s[end:], nil
-	case "true", "false":
-		return fnArg{kind: argBool, b: tok == "true"}, s[end:], nil
-	}
-	v, err := decodeJSON([]byte(tok))
-	if n, ok := v.(json.Number); err == nil && ok {
-		return fnArg{kind: argNumber, num: n}, s[end:], nil
-	}
-	return fnArg{}, "", fmt.Errorf("invalid argument %q", tok)
+	return m, nil
 }
 
-// argEnd returns the end of a bare (path, number, literal) argument.
-func argEnd(s string) int {
-	depth := 0
-	var quote byte
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if quote != 0 {
-			switch c {
-			case '\\':
-				i++
-			case quote:
-				quote = 0
-			}
-			continue
+// argInt converts a number to an integer with round (math.Round or math.Floor).
+func argInt(name string, v any, round func(float64) float64) (int64, error) {
+	f, ok := toFloat(v)
+	if !ok {
+		return 0, intrinsicFailure("%s: expected a number, got %s", name, typeName(v))
+	}
+	r := round(f)
+	if r < math.MinInt64 || r > math.MaxInt64 {
+		return 0, intrinsicFailure("%s: %v is out of range", name, v)
+	}
+	return int64(r), nil
+}
+
+func mergeIntrinsics(override IntrinsicFuncs) (map[string]Func, error) {
+	funcs := make(map[string]Func, len(defaultIntrinsics))
+	for k, f := range defaultIntrinsics {
+		funcs[k] = f
+	}
+	for k, f := range override {
+		if _, ok := defaultIntrinsics[k]; !ok {
+			return nil, fmt.Errorf("unknown intrinsic function: %s", k)
 		}
-		switch c {
-		case '\'', '"':
-			quote = c
-		case '[', '(':
-			depth++
-		case ']':
-			depth--
-		case ')':
-			if depth == 0 {
-				return i
-			}
-			depth--
-		case ',':
-			if depth == 0 {
-				return i
-			}
+		if f != nil {
+			funcs[k] = f
 		}
 	}
-	return len(s)
+	return funcs, nil
 }
-
-// intrinsicArity holds the minimum and maximum number of arguments (-1 = unlimited).
-var intrinsicArity = map[string][2]int{
-	"States.Format":         {1, -1},
-	"States.StringToJson":   {1, 1},
-	"States.JsonToString":   {1, 1},
-	"States.Array":          {0, -1},
-	"States.ArrayPartition": {2, 2},
-	"States.ArrayContains":  {2, 2},
-	"States.ArrayRange":     {3, 3},
-	"States.ArrayGetItem":   {2, 2},
-	"States.ArrayLength":    {1, 1},
-	"States.ArrayUnique":    {1, 1},
-	"States.Base64Encode":   {1, 1},
-	"States.Base64Decode":   {1, 1},
-	"States.Hash":           {2, 2},
-	"States.JsonMerge":      {3, 3},
-	"States.MathRandom":     {2, 3},
-	"States.MathAdd":        {2, 2},
-	"States.StringSplit":    {2, 2},
-	"States.UUID":           {0, 0},
-}
-
-func checkArity(c *fnCall) error {
-	a := intrinsicArity[c.name]
-	n := len(c.args)
-	if n < a[0] || (a[1] >= 0 && n > a[1]) {
-		return fmt.Errorf("%s: wrong number of arguments: %d", c.name, n)
-	}
-	return nil
-}
-
-// ---- evaluation ----
 
 func (r *runner) evalIntrinsic(c *fnCall, penv pathEnv) (any, error) {
 	args := make([]any, len(c.args))
@@ -488,7 +423,7 @@ func (r *runner) evalIntrinsic(c *fnCall, penv pathEnv) (any, error) {
 			if err != nil {
 				return nil, intrinsicFailure("%s: %s: %s", c.name, a.path.src, err)
 			}
-			args[i] = v
+			args[i] = deepCopy(v)
 		case argCall:
 			v, err := r.evalIntrinsic(a.call, penv)
 			if err != nil {
@@ -498,189 +433,16 @@ func (r *runner) evalIntrinsic(c *fnCall, penv pathEnv) (any, error) {
 		}
 	}
 
-	v, err := callIntrinsic(r.env.intrinsic, c.name, args)
+	v, err := r.env.intrinsic[c.name](args...)
 	if err != nil {
-		return nil, err
+		if se, ok := asStatesError(err); ok {
+			return nil, &StatesError{Name: se.Name, Cause: se.Cause}
+		}
+		return nil, fatal(fmt.Errorf("%s: %w", c.name, err))
 	}
 	n, err := normalize(v)
 	if err != nil {
 		return nil, intrinsicFailure("%s: %s", c.name, err)
 	}
 	return n, nil
-}
-
-func argStr(name string, v any) (string, error) {
-	s, ok := v.(string)
-	if !ok {
-		return "", intrinsicFailure("%s: expected a string, got %s", name, typeName(v))
-	}
-	return s, nil
-}
-
-func argArray(name string, v any) ([]any, error) {
-	a, ok := v.([]any)
-	if !ok {
-		return nil, intrinsicFailure("%s: expected an array, got %s", name, typeName(v))
-	}
-	return a, nil
-}
-
-func argObject(name string, v any) (map[string]any, error) {
-	m, ok := v.(map[string]any)
-	if !ok {
-		return nil, intrinsicFailure("%s: expected an object, got %s", name, typeName(v))
-	}
-	return m, nil
-}
-
-// argInt rounds a number to the nearest integer.
-func argInt(name string, v any) (int64, error) {
-	f, ok := toFloat(v)
-	if !ok {
-		return 0, intrinsicFailure("%s: expected a number, got %s", name, typeName(v))
-	}
-	r := math.Round(f)
-	if r < math.MinInt64 || r > math.MaxInt64 {
-		return 0, intrinsicFailure("%s: %v is out of range", name, v)
-	}
-	return int64(r), nil
-}
-
-func callIntrinsic(f Intrinsic, name string, args []any) (any, error) {
-	switch name {
-	case "States.Format":
-		t, err := argStr(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		return f.Format(t, args[1:]...)
-	case "States.StringToJson":
-		s, err := argStr(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		return f.StringToJson(s)
-	case "States.JsonToString":
-		return f.JsonToString(args[0])
-	case "States.Array":
-		return f.Array(args...)
-	case "States.ArrayPartition":
-		a, err := argArray(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		n, err := argInt(name, args[1])
-		if err != nil {
-			return nil, err
-		}
-		return f.ArrayPartition(a, n)
-	case "States.ArrayContains":
-		a, err := argArray(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		return f.ArrayContains(a, args[1])
-	case "States.ArrayRange":
-		var n [3]int64
-		for i := range n {
-			v, err := argInt(name, args[i])
-			if err != nil {
-				return nil, err
-			}
-			n[i] = v
-		}
-		return f.ArrayRange(n[0], n[1], n[2])
-	case "States.ArrayGetItem":
-		a, err := argArray(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		i, err := argInt(name, args[1])
-		if err != nil {
-			return nil, err
-		}
-		return f.ArrayGetItem(a, i)
-	case "States.ArrayLength":
-		a, err := argArray(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		return f.ArrayLength(a)
-	case "States.ArrayUnique":
-		a, err := argArray(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		return f.ArrayUnique(a)
-	case "States.Base64Encode", "States.Base64Decode":
-		s, err := argStr(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		if name == "States.Base64Encode" {
-			return f.Base64Encode(s)
-		}
-		return f.Base64Decode(s)
-	case "States.Hash":
-		alg, err := argStr(name, args[1])
-		if err != nil {
-			return nil, err
-		}
-		return f.Hash(args[0], alg)
-	case "States.JsonMerge":
-		a, err := argObject(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		b, err := argObject(name, args[1])
-		if err != nil {
-			return nil, err
-		}
-		deep, ok := args[2].(bool)
-		if !ok {
-			return nil, intrinsicFailure("%s: expected a boolean, got %s", name, typeName(args[2]))
-		}
-		return f.JsonMerge(a, b, deep)
-	case "States.MathRandom":
-		start, err := argInt(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		end, err := argInt(name, args[1])
-		if err != nil {
-			return nil, err
-		}
-		var seed *int64
-		if len(args) > 2 {
-			s, err := argInt(name, args[2])
-			if err != nil {
-				return nil, err
-			}
-			seed = &s
-		}
-		return f.MathRandom(start, end, seed)
-	case "States.MathAdd":
-		a, err := argInt(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		b, err := argInt(name, args[1])
-		if err != nil {
-			return nil, err
-		}
-		return f.MathAdd(a, b)
-	case "States.StringSplit":
-		s, err := argStr(name, args[0])
-		if err != nil {
-			return nil, err
-		}
-		d, err := argStr(name, args[1])
-		if err != nil {
-			return nil, err
-		}
-		return f.StringSplit(s, d)
-	case "States.UUID":
-		return f.UUID()
-	}
-	return nil, fmt.Errorf("unknown intrinsic function: %s", name)
 }

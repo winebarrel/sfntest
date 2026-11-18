@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/recolabs/gnata"
 )
 
 const (
@@ -45,6 +47,7 @@ type catcher struct {
 	Next        string         `json:"Next"`
 	ResultPath  optString      `json:"ResultPath"`
 	Assign      map[string]any `json:"Assign"`
+	Output      any            `json:"Output"`
 	Comment     string         `json:"Comment"`
 }
 
@@ -150,6 +153,17 @@ var jsonPathFields = map[string][]string{
 	"Map":      {"Next", "End", "InputPath", "OutputPath", "ResultPath", "Parameters", "ResultSelector", "ItemsPath", "ItemSelector", "Iterator", "ItemProcessor", "MaxConcurrency", "MaxConcurrencyPath", "Retry", "Catch", "Assign", "ItemReader", "ItemBatcher", "ResultWriter", "ToleratedFailureCount", "ToleratedFailurePercentage", "ToleratedFailureCountPath", "ToleratedFailurePercentagePath", "Label"},
 }
 
+var jsonataFields = map[string][]string{
+	"Pass":     {"Next", "End", "Output", "Assign"},
+	"Task":     {"Next", "End", "Arguments", "Output", "Assign", "Resource", "Retry", "Catch", "TimeoutSeconds", "HeartbeatSeconds", "Credentials"},
+	"Choice":   {"Choices", "Default", "Output", "Assign"},
+	"Wait":     {"Next", "End", "Seconds", "Timestamp", "Output", "Assign"},
+	"Succeed":  {"Output"},
+	"Fail":     {"Error", "Cause"},
+	"Parallel": {"Next", "End", "Arguments", "Output", "Assign", "Branches", "Retry", "Catch"},
+	"Map":      {"Next", "End", "Items", "ItemSelector", "Iterator", "ItemProcessor", "MaxConcurrency", "Output", "Assign", "Retry", "Catch", "ItemReader", "ItemBatcher", "ResultWriter", "ToleratedFailureCount", "ToleratedFailurePercentage", "Label"},
+}
+
 func decodeStrict(b []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.UseNumber()
@@ -157,21 +171,22 @@ func decodeStrict(b []byte, v any) error {
 }
 
 type validator struct {
-	typ  WorkflowType
-	errs []string
+	typ   WorkflowType
+	errs  []string
+	exprs map[string]*gnata.Expression
 }
 
 func (v *validator) errorf(format string, args ...any) {
 	v.errs = append(v.errs, fmt.Sprintf(format, args...))
 }
 
-func parseMachine(def []byte, typ WorkflowType) (*machine, error) {
+func parseMachine(def []byte, typ WorkflowType) (*machine, map[string]*gnata.Expression, error) {
 	m := &machine{}
 	if err := decodeStrict(def, m); err != nil {
-		return nil, fmt.Errorf("invalid state machine definition: %w", err)
+		return nil, nil, fmt.Errorf("invalid state machine definition: %w", err)
 	}
 
-	v := &validator{typ: typ}
+	v := &validator{typ: typ, exprs: map[string]*gnata.Expression{}}
 	query := queryJSONPath
 	if m.QueryLanguage != "" {
 		query = m.QueryLanguage
@@ -182,9 +197,9 @@ func parseMachine(def []byte, typ WorkflowType) (*machine, error) {
 	v.machine(m, "", query, true)
 
 	if len(v.errs) > 0 {
-		return nil, fmt.Errorf("invalid state machine definition:\n  %s", strings.Join(v.errs, "\n  "))
+		return nil, nil, fmt.Errorf("invalid state machine definition:\n  %s", strings.Join(v.errs, "\n  "))
 	}
-	return m, nil
+	return m, v.exprs, nil
 }
 
 func (v *validator) machine(m *machine, prefix, query string, top bool) {
@@ -268,19 +283,18 @@ func sortedRawKeys(m map[string]json.RawMessage) []string {
 }
 
 func (v *validator) state(s *state, path string) {
+	fields := jsonPathFields
 	if s.query == queryJSONata {
-		v.errorf("%s: the JSONata query language is not supported yet", path)
-		return
+		fields = jsonataFields
 	}
-
-	allowed, ok := jsonPathFields[s.Type]
+	allowed, ok := fields[s.Type]
 	if !ok {
 		v.errorf("%s.Type: unknown state type %q", path, s.Type)
 		return
 	}
 	for _, k := range s.keys {
 		if !slices.Contains(commonFields, k) && !slices.Contains(allowed, k) {
-			v.errorf("%s: field %q is not allowed in a %s state", path, k, s.Type)
+			v.errorf("%s: field %q is not allowed in a %s %s state", path, k, s.query, s.Type)
 		}
 	}
 
@@ -295,12 +309,11 @@ func (v *validator) state(s *state, path string) {
 		}
 	}
 
-	v.pathField(path+".InputPath", s.InputPath, false)
-	v.pathField(path+".OutputPath", s.OutputPath, false)
-	v.resultPath(path+".ResultPath", s.ResultPath)
-	v.template(path+".Parameters", s.Parameters)
-	v.template(path+".ResultSelector", s.ResultSelector)
-	v.assign(path+".Assign", s.Assign)
+	if s.query == queryJSONata {
+		v.jsonataState(s, path)
+	} else {
+		v.jsonPathState(s, path)
+	}
 	v.retryCatch(path, s)
 
 	switch s.Type {
@@ -322,8 +335,51 @@ func (v *validator) state(s *state, path string) {
 			v.errorf("%s.Choices: required", path)
 		}
 		for i, rule := range s.Choices {
-			v.choiceRule(fmt.Sprintf("%s.Choices[%d]", path, i), rule, true)
+			p := fmt.Sprintf("%s.Choices[%d]", path, i)
+			if s.query == queryJSONata {
+				v.jsonataChoiceRule(p, rule)
+			} else {
+				v.choiceRule(p, rule, true)
+			}
 		}
+	case "Parallel":
+		if len(s.Branches) == 0 {
+			v.errorf("%s.Branches: required", path)
+		}
+		for i, b := range s.Branches {
+			v.machine(b, fmt.Sprintf("%s.Branches[%d].", path, i), s.query, false)
+		}
+	case "Map":
+		p := s.processor()
+		if p == nil {
+			v.errorf("%s.ItemProcessor: required", path)
+			return
+		}
+		if s.ItemProcessor != nil && s.Iterator != nil {
+			v.errorf("%s: ItemProcessor and Iterator cannot be used together", path)
+		}
+		if p.ProcessorConfig != nil && p.ProcessorConfig.Mode == "DISTRIBUTED" {
+			v.errorf("%s: distributed Map is not supported yet", path)
+			return
+		}
+		for _, k := range []string{"ItemReader", "ItemBatcher", "ResultWriter", "ToleratedFailureCount", "ToleratedFailurePercentage", "ToleratedFailureCountPath", "ToleratedFailurePercentagePath", "Label"} {
+			if s.has(k) {
+				v.errorf("%s: field %q is only allowed in a distributed Map", path, k)
+			}
+		}
+		v.machine(p, path+".ItemProcessor.", s.query, false)
+	}
+}
+
+func (v *validator) jsonPathState(s *state, path string) {
+	v.pathField(path+".InputPath", s.InputPath, false)
+	v.pathField(path+".OutputPath", s.OutputPath, false)
+	v.resultPath(path+".ResultPath", s.ResultPath)
+	v.template(path+".Parameters", s.Parameters)
+	v.template(path+".ResultSelector", s.ResultSelector)
+	v.assign(path+".Assign", s.Assign)
+
+	switch s.Type {
 	case "Wait":
 		n := 0
 		if s.Seconds != nil {
@@ -358,37 +414,12 @@ func (v *validator) state(s *state, path string) {
 		}
 		v.pathOrIntrinsic(path+".ErrorPath", s.ErrorPath)
 		v.pathOrIntrinsic(path+".CausePath", s.CausePath)
-	case "Parallel":
-		if len(s.Branches) == 0 {
-			v.errorf("%s.Branches: required", path)
-		}
-		for i, b := range s.Branches {
-			v.machine(b, fmt.Sprintf("%s.Branches[%d].", path, i), s.query, false)
-		}
 	case "Map":
-		p := s.processor()
-		if p == nil {
-			v.errorf("%s.ItemProcessor: required", path)
-			return
-		}
-		if s.ItemProcessor != nil && s.Iterator != nil {
-			v.errorf("%s: ItemProcessor and Iterator cannot be used together", path)
-		}
 		if s.ItemSelector != nil && s.Parameters != nil {
 			v.errorf("%s: ItemSelector and Parameters cannot be used together", path)
 		}
-		if p.ProcessorConfig != nil && p.ProcessorConfig.Mode == "DISTRIBUTED" {
-			v.errorf("%s: distributed Map is not supported yet", path)
-			return
-		}
-		for _, k := range []string{"ItemReader", "ItemBatcher", "ResultWriter", "ToleratedFailureCount", "ToleratedFailurePercentage", "ToleratedFailureCountPath", "ToleratedFailurePercentagePath", "Label"} {
-			if s.has(k) {
-				v.errorf("%s: field %q is only allowed in a distributed Map", path, k)
-			}
-		}
 		v.pathField(path+".ItemsPath", s.ItemsPath, false)
 		v.template(path+".ItemSelector", s.ItemSelector)
-		v.machine(p, path+".ItemProcessor.", s.query, false)
 	}
 }
 
@@ -520,8 +551,19 @@ func (v *validator) retryCatch(path string, s *state) {
 		if c.Next == "" {
 			v.errorf("%s.Next: required", p)
 		}
-		v.resultPath(p+".ResultPath", c.ResultPath)
-		v.assign(p+".Assign", c.Assign)
+		if s.query == queryJSONata {
+			if c.ResultPath.set {
+				v.errorf("%s: field \"ResultPath\" is not allowed in a JSONata state", p)
+			}
+			v.jsonataAssign(p+".Assign", c.Assign)
+			v.jsonata(p+".Output", c.Output)
+		} else {
+			if c.Output != nil {
+				v.errorf("%s: field \"Output\" is not allowed in a JSONPath state", p)
+			}
+			v.resultPath(p+".ResultPath", c.ResultPath)
+			v.assign(p+".Assign", c.Assign)
+		}
 	}
 }
 
@@ -646,4 +688,107 @@ func toNonNegInt(v any) (int64, bool) {
 		return 0, false
 	}
 	return i, true
+}
+
+// jsonata compiles every "{% ... %}" string at any depth of t.
+func (v *validator) jsonata(path string, t any) {
+	switch t := t.(type) {
+	case string:
+		open, closed := strings.HasPrefix(t, "{%"), strings.HasSuffix(t, "%}")
+		if !open && !closed {
+			return
+		}
+		if !isJSONataExpr(t) {
+			v.errorf("%s: a JSONata expression must start with '{%%' and end with '%%}'", path)
+			return
+		}
+		if _, ok := v.exprs[t]; ok {
+			return
+		}
+		e, err := compileJSONata(jsonataSource(t))
+		if err != nil {
+			v.errorf("%s: %s", path, err)
+			return
+		}
+		v.exprs[t] = e
+	case map[string]any:
+		for _, k := range sortedKeys(t) {
+			v.jsonata(path+"."+k, t[k])
+		}
+	case []any:
+		for i, e := range t {
+			v.jsonata(fmt.Sprintf("%s[%d]", path, i), e)
+		}
+	}
+}
+
+func (v *validator) jsonataAssign(path string, a map[string]any) {
+	for k := range a {
+		if !validVarName(k) {
+			v.errorf("%s: invalid variable name %q", path, k)
+		}
+	}
+	v.jsonata(path, map[string]any(a))
+}
+
+func (v *validator) jsonataState(s *state, path string) {
+	v.jsonata(path+".Arguments", s.Arguments)
+	v.jsonata(path+".Output", s.Output)
+	v.jsonataAssign(path+".Assign", s.Assign)
+	v.jsonata(path+".Items", s.Items)
+	v.jsonata(path+".ItemSelector", s.ItemSelector)
+	v.jsonata(path+".TimeoutSeconds", s.TimeoutSeconds)
+	v.jsonata(path+".HeartbeatSeconds", s.HeartbeatSeconds)
+
+	switch s.Type {
+	case "Wait":
+		if (s.Seconds == nil) == (s.Timestamp == nil) {
+			v.errorf("%s: exactly one of Seconds and Timestamp is required", path)
+		}
+		if str, ok := s.Seconds.(string); ok {
+			v.jsonata(path+".Seconds", str)
+		} else if s.Seconds != nil {
+			if _, ok := toNonNegInt(s.Seconds); !ok {
+				v.errorf("%s.Seconds: must be a non-negative integer", path)
+			}
+		}
+		if str, ok := s.Timestamp.(string); ok {
+			if isJSONataExpr(str) {
+				v.jsonata(path+".Timestamp", str)
+			} else if !isTimestamp(str) {
+				v.errorf("%s.Timestamp: must be a timestamp", path)
+			}
+		} else if s.Timestamp != nil {
+			v.errorf("%s.Timestamp: must be a timestamp", path)
+		}
+	case "Fail":
+		v.jsonata(path+".Error", s.Error.v)
+		v.jsonata(path+".Cause", s.Cause.v)
+	}
+}
+
+func (v *validator) jsonataChoiceRule(path string, rule map[string]any) {
+	for k := range rule {
+		switch k {
+		case "Condition", "Next", "Assign", "Comment":
+		default:
+			v.errorf("%s: field %q is not allowed in a JSONata Choice rule", path, k)
+		}
+	}
+	if _, ok := rule["Next"].(string); !ok {
+		v.errorf("%s.Next: required", path)
+	}
+	switch c := rule["Condition"].(type) {
+	case bool:
+	case string:
+		if !isJSONataExpr(c) {
+			v.errorf("%s.Condition: must be a JSONata expression or a boolean", path)
+		}
+		v.jsonata(path+".Condition", c)
+	default:
+		v.errorf("%s.Condition: must be a JSONata expression or a boolean", path)
+	}
+	if a, ok := rule["Assign"].(map[string]any); ok {
+		v.jsonataAssign(path+".Assign", a)
+	}
 }

@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/recolabs/gnata"
 )
 
 // WorkflowType is the type of a state machine.
@@ -74,8 +76,9 @@ func WithVariableLimit(perVariable, total int) Option {
 
 // StateMachine is a parsed and validated state machine definition.
 type StateMachine struct {
-	def  *machine
-	opts options
+	def     *machine
+	opts    options
+	jsonata map[string]*gnata.Expression
 }
 
 // New parses and validates a state machine definition (Amazon States
@@ -92,12 +95,12 @@ func New(definition []byte, opts ...Option) (*StateMachine, error) {
 		opt(&o)
 	}
 
-	m, err := parseMachine(definition, o.typ)
+	m, exprs, err := parseMachine(definition, o.typ)
 	if err != nil {
 		return nil, err
 	}
 
-	return &StateMachine{def: m, opts: o}, nil
+	return &StateMachine{def: m, opts: o, jsonata: exprs}, nil
 }
 
 // Status is the status of an execution.
@@ -180,6 +183,9 @@ func (sm *StateMachine) Run(ctx context.Context, input []byte, env *Env) (*Resul
 		sm:    sm,
 		env:   renv,
 		input: in,
+	}
+	if r.jsonata, err = r.newJSONataEnv(renv.jsonata); err != nil {
+		return nil, err
 	}
 
 	res := &Result{}

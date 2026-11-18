@@ -76,12 +76,6 @@ const orderDef = `{
   }
 }`
 
-type fixedUUID struct {
-	sfntest.DefaultIntrinsic
-}
-
-func (fixedUUID) UUID() (string, error) { return "uuid-1", nil }
-
 func TestOrder_SucceedsAfterRetry(t *testing.T) {
 	api := &mockAPI{handler: func(n int, resource string, p map[string]any) (any, error) {
 		if n == 1 {
@@ -92,7 +86,9 @@ func TestOrder_SucceedsAfterRetry(t *testing.T) {
 		return map[string]any{"Payload": map[string]any{"status": "OK"}}, nil
 	}}
 
-	res := run(t, orderDef, `{"orderId":"123"}`, &sfntest.Env{API: api, Intrinsic: fixedUUID{}})
+	res := run(t, orderDef, `{"orderId":"123"}`, &sfntest.Env{API: api, Intrinsic: sfntest.IntrinsicFuncs{
+		"States.UUID": func(...any) (any, error) { return "uuid-1", nil },
+	}})
 
 	assert.Equal(t, sfntest.Succeeded, res.Status)
 	assert.JSONEq(t, `{"receiptId":"uuid-1"}`, string(res.Output))
@@ -435,7 +431,10 @@ func TestValidation(t *testing.T) {
 		`{"StartAt":"A","States":{"A":{"Type":"Task","Resource":"r","End":true,"Retry":[{"ErrorEquals":["States.ALL"]},{"ErrorEquals":["E"]}]}}}`: "States.ALL must be in the last element",
 		`{"StartAt":"A","States":{"A":{"Type":"Pass","End":true,"ResultPath":"$.a[*]"}}}`:                                                         "reference path",
 		`{"StartAt":"A","States":{"A":{"Type":"Choice","Choices":[{"Variable":"$.a","StringEquals":1,"Next":"A"}]}}}`:                             "must be a string",
-		`{"StartAt":"A","States":{"A":{"Type":"Pass","End":true}},"QueryLanguage":"JSONata"}`:                                                     "not supported yet",
+		`{"StartAt":"A","States":{"A":{"Type":"Pass","End":true,"InputPath":"$"}},"QueryLanguage":"JSONata"}`:                                     `field "InputPath" is not allowed in a JSONata Pass state`,
+		`{"StartAt":"A","States":{"A":{"Type":"Pass","End":true,"Output":"{% $x + %}"}},"QueryLanguage":"JSONata"}`:                               "States.A.Output",
+		`{"StartAt":"A","States":{"A":{"Type":"Pass","End":true,"Output":"{% 1 %} "}},"QueryLanguage":"JSONata"}`:                                 "must start with '{%' and end with '%}'",
+		`{"StartAt":"A","States":{"A":{"Type":"Pass","End":true,"QueryLanguage":"JSONPath"}},"QueryLanguage":"JSONata"}`:                          "cannot be used in a JSONata state machine",
 	}
 	for def, want := range cases {
 		_, err := sfntest.New([]byte(def))

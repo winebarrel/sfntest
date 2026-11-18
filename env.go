@@ -82,9 +82,12 @@ const (
 type Env struct {
 	// API receives service calls. If nil, any service call aborts Run.
 	API API
-	// Intrinsic implements the States.* intrinsic functions.
-	// If nil, DefaultIntrinsic is used.
-	Intrinsic Intrinsic
+	// Intrinsic replaces States.* intrinsic functions of the JSONPath query
+	// language. Functions not in the map use the default implementation.
+	Intrinsic IntrinsicFuncs
+	// JSONata replaces or adds JSONata functions. Functions not in the map
+	// use the default implementation.
+	JSONata JSONataFuncs
 	// Execution holds context object values. If nil, defaults are used.
 	Execution *Execution
 	// Clock is the execution clock. If nil, a FakeClock starting at
@@ -96,7 +99,8 @@ type Env struct {
 
 type resolvedEnv struct {
 	api       API
-	intrinsic Intrinsic
+	intrinsic map[string]Func
+	jsonata   JSONataFuncs
 	exec      Execution
 	clock     Clock
 	taskToken TaskToken
@@ -109,7 +113,7 @@ func resolveEnv(env *Env) (*resolvedEnv, error) {
 
 	r := &resolvedEnv{
 		api:       env.API,
-		intrinsic: env.Intrinsic,
+		jsonata:   env.JSONata,
 		clock:     env.Clock,
 		taskToken: env.TaskToken,
 	}
@@ -132,9 +136,11 @@ func resolveEnv(env *Env) (*resolvedEnv, error) {
 	if r.exec.StartTime.IsZero() {
 		r.exec.StartTime = time.Now()
 	}
-	if r.intrinsic == nil {
-		r.intrinsic = DefaultIntrinsic{}
+	intrinsic, err := mergeIntrinsics(env.Intrinsic)
+	if err != nil {
+		return nil, err
 	}
+	r.intrinsic = intrinsic
 	if r.clock == nil {
 		r.clock = &FakeClock{T: r.exec.StartTime}
 	}
