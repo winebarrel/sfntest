@@ -101,3 +101,7 @@ func isFatal(err error) bool {
 	var fe *fatalError
 	return errors.As(err, &fe)
 }
+
+func errUnsupportedState(typ string) error {
+	return fmt.Errorf("unsupported state type: %s", typ)
+}

@@ -17,6 +17,7 @@ type runner struct {
 	input    any
 	execID   string
 	varBytes int
+	jsonata  *jsonataEnv
 }
 
 // ---- variables ----
@@ -183,6 +184,9 @@ func (r *runner) runMachine(m *machine, input any, sc *scope, events *[]Event) (
 }
 
 func (r *runner) runState(s *state, input any, sc *scope, ev *Event) (any, string, error) {
+	if s.query == queryJSONata {
+		return r.runStateJSONata(s, input, sc, ev)
+	}
 	stc := stateCtx{name: s.name, entered: ev.EnteredTime}
 
 	switch s.Type {
@@ -259,21 +263,9 @@ func (r *runner) withRetry(s *state, input any, sc *scope, ev *Event, attempt fu
 			if !errorMatches(c.ErrorEquals, se.Name) {
 				continue
 			}
-			errOut := map[string]any{"Error": se.Name, "Cause": se.Cause}
 			stc := stateCtx{name: s.name, entered: ev.EnteredTime, retryCount: retryCount}
-
-			vars, err := r.evalAssign(c.Assign, r.penv(errOut, sc, stc))
+			out, err := r.catch(s, c, input, se, sc, stc, ev)
 			if err != nil {
-				return nil, "", err
-			}
-			out, err := applyResultPath(input, c.ResultPath, errOut)
-			if err != nil {
-				return nil, "", err
-			}
-			if err := r.checkPayload(out); err != nil {
-				return nil, "", err
-			}
-			if err := r.commitAssign(sc, vars, ev); err != nil {
 				return nil, "", err
 			}
 			ev.Error, ev.Cause = se.Name, se.Cause
@@ -282,6 +274,41 @@ func (r *runner) withRetry(s *state, input any, sc *scope, ev *Event, attempt fu
 
 		return nil, "", se
 	}
+}
+
+func (r *runner) catch(s *state, c *catcher, input any, se *StatesError, sc *scope, stc stateCtx, ev *Event) (any, error) {
+	errOut := map[string]any{"Error": se.Name, "Cause": se.Cause}
+
+	var vars map[string]any
+	var out any
+	var err error
+	if s.query == queryJSONata {
+		jv, err := r.jsonataVars(sc, jsonataStates{input: input, errorOutput: errOut, hasError: true, context: r.contextObject(stc)})
+		if err != nil {
+			return nil, err
+		}
+		if vars, err = r.evalJSONataAssign(c.Assign, jv); err != nil {
+			return nil, err
+		}
+		out = errOut
+		if c.Output != nil {
+			if out, err = r.evalJSONata(c.Output, jv); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		if vars, err = r.evalAssign(c.Assign, r.penv(errOut, sc, stc)); err != nil {
+			return nil, err
+		}
+		if out, err = applyResultPath(input, c.ResultPath, errOut); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := r.checkPayload(out); err != nil {
+		return nil, err
+	}
+	return out, r.commitAssign(sc, vars, ev)
 }
 
 func findRetrier(retriers []*retrier, name string) int {
@@ -437,8 +464,10 @@ func (r *runner) evalAssign(a map[string]any, penv pathEnv) (map[string]any, err
 	if err != nil {
 		return nil, err
 	}
-	vars := v.(map[string]any)
+	return r.checkVariables(v.(map[string]any))
+}
 
+func (r *runner) checkVariables(vars map[string]any) (map[string]any, error) {
 	total := 0
 	for name, val := range vars {
 		n := len(mustEncodeJSON(val))
