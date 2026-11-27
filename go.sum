@@ -1,5 +1,5 @@
-github.com/recolabs/gnata v0.6.2 h1:kURF0jWLPiNdA9t/1aRKhDXiyL0/e5hQZerqkuapoyw=
-github.com/recolabs/gnata v0.6.2/go.mod h1:+u5DmoYMyHl+9Uuo9KQXLhbKHip+M5N8S/QYAPSG0XU=
+github.com/recolabs/gnata v0.6.3 h1:qzlU3FTzRsf+HJUgtSnoj9kHn6DG1l2XH4wpV+I92IU=
+github.com/recolabs/gnata v0.6.3/go.mod h1:+u5DmoYMyHl+9Uuo9KQXLhbKHip+M5N8S/QYAPSG0XU=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
 github.com/tidwall/gjson v1.18.0 h1:FIDeeyB800efLX89e5a8Y0BNH+LOngJyGrIWxG2FKQY=
