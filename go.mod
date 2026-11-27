@@ -3,7 +3,7 @@ module github.com/winebarrel/sfntest
 go 1.26.0
 
 require (
-	github.com/recolabs/gnata v0.6.2
+	github.com/recolabs/gnata v0.6.3
 	github.com/stretchr/testify v1.12.1
 )
 
